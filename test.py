@@ -11,7 +11,8 @@ HOLE_MAX_RADIUS = 10  # Maximum radius of a detected hole (pixels)
 HOLE_CONTRAST_THRESHOLD = 50  # Minimum grayscale difference to detect a hole
 FRAME_RATE = 2  # Frames per second (used in live mode)
 MAX_SHOTS = 10  # Stop after 10 shots
-OUTERMOST_RING_RADIUS = 1200  # Radius of the outermost ring (ring 9, score 1)
+OUTERMOST_RING_RADIUS = 1923.75  # Computed as 9 * (black_circle_radius / 4)
+OUTPUT_FOLDER = "output"
 
 class TargetScorer:
     def __init__(self, mode="live", image_paths=None):
@@ -34,30 +35,57 @@ class TargetScorer:
         
         self.center_x, self.center_y = None, None
         self.black_circle_radius = None
-        self.inner_ring_increment = None
-        self.outer_ring_increment = None
+        self.ring_increment = None  # Simplified to a single increment
         self.shots = []
         self.total_score = 0
         self.previous_frame = None
         self.shot_overlay = None
         
+        # Ensure output folder exists
+        if not os.path.exists(OUTPUT_FOLDER):
+            os.makedirs(OUTPUT_FOLDER)
+    
     def calibrate_target(self, frame):
         """Calibrate the target by detecting the large black center circle."""
+        # Convert to grayscale and blur to reduce noise
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (9, 9), 0)
-        
-        # Detect the large black circle (diameter ~ half image width)
+
+        # Debug: Print intensity range of the grayscale image
+        min_intensity, max_intensity = np.min(blurred), np.max(blurred)
+        print(f"Grayscale intensity range: min={min_intensity}, max={max_intensity}")
+
+        # Debug: Save thresholded images at different values
+        for thresh_value in [70, 90, 110]:
+            _, thresh_debug = cv2.threshold(blurred, thresh_value, 255, cv2.THRESH_BINARY_INV)
+            kernel = np.ones((15, 15), np.uint8)
+            thresh_debug = cv2.morphologyEx(thresh_debug, cv2.MORPH_CLOSE, kernel)
+            cv2.imwrite(f"output/thresh_for_circle_{thresh_value}.jpg", thresh_debug)
+            print(f"Saved thresholded image as 'thresh_for_circle_{thresh_value}.jpg' with threshold value {thresh_value}")
+
+        # Threshold to isolate the dark gray area (black center)
+        thresh_value = 110  # Confirmed to work well
+        _, thresh = cv2.threshold(blurred, thresh_value, 255, cv2.THRESH_BINARY_INV)
+        # Morphological closing to fill small holes (e.g., bullet holes)
+        kernel = np.ones((15, 15), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        # Debug: Save the final thresholded image
+        cv2.imwrite("output/thresh_for_circle.jpg", thresh)
+        print(f"Saved final thresholded image as 'thresh_for_circle.jpg' with threshold value {thresh_value}")
+
+        # Detect the large black circle
         circles = cv2.HoughCircles(
-            blurred,
+            thresh,
             cv2.HOUGH_GRADIENT,
             dp=1,
-            minDist=200,
+            minDist=300,
             param1=100,
-            param2=50,
-            minRadius=600,  # Minimum radius for the large black circle
-            maxRadius=800   # Maximum radius for the large black circle
+            param2=30,
+            minRadius=600,
+            maxRadius=1000
         )
-        
+
         # Debug: Draw all detected circles
         debug_frame = frame.copy()
         if circles is not None:
@@ -66,7 +94,7 @@ class TargetScorer:
                 cv2.circle(debug_frame, (x, y), r, (0, 255, 255), 2)
                 cv2.circle(debug_frame, (x, y), 5, (0, 255, 255), -1)
                 cv2.putText(debug_frame, f"C{i}", (x + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-            cv2.imwrite("detected_circles.jpg", debug_frame)
+            cv2.imwrite("output/detected_circles.jpg", debug_frame)
             print(f"Saved detected circles image as 'detected_circles.jpg' with {len(circles)} circles detected.")
 
             # Select the circle closest to the image center
@@ -74,37 +102,29 @@ class TargetScorer:
             distances = [np.sqrt((x - image_center_x)**2 + (y - image_center_y)**2) for x, y, _ in circles]
             closest_circle_idx = np.argmin(distances)
             self.center_x, self.center_y, self.black_circle_radius = circles[closest_circle_idx]
-            
-            # Calculate ring increments
-            # Inner rings (0-3, scores 10-7) within the black circle
-            self.inner_ring_increment = self.black_circle_radius / 3
-            # Outer rings (4-9, scores 6-1) from black circle edge to outermost ring
-            self.outer_ring_increment = (OUTERMOST_RING_RADIUS - self.black_circle_radius) / 6
+
+            # Verify the detected radius
+            expected_radius = frame.shape[1] // 4
+            if not (expected_radius * 0.8 < self.black_circle_radius < expected_radius * 1.2):
+                print(f"Warning: Detected black circle radius ({self.black_circle_radius}) is not close to expected ({expected_radius})")
+
+            # Calculate single ring increment
+            # Use black_circle_radius / 4 for all rings
+            self.ring_increment = self.black_circle_radius / 4  # Consistent increment for all rings
             
             print(f"Calibrated: Center at ({self.center_x}, {self.center_y}), Black circle radius: {self.black_circle_radius}")
-            print(f"Inner ring increment: {self.inner_ring_increment}, Outer ring increment: {self.outer_ring_increment}")
+            print(f"Ring increment: {self.ring_increment}")
+            print(f"Ring 4 (score 7) radius: {4 * self.ring_increment} (should match black_circle_radius)")
+            print(f"Ring 10 (score 1) radius: {10 * self.ring_increment}")
         else:
             raise ValueError("Could not detect the black center circle for calibration.")
     
     def draw_scoring_zones(self, frame):
-        """Draw the scoring zones (rings 0-9, scores 10-1) on the frame."""
-        # Inner rings (0-3, scores 10-7)
-        for ring_number in range(4):
-            radius = int(self.inner_ring_increment * ring_number)
-            score = 10 - ring_number
-            color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)][ring_number % 3]
-            cv2.circle(frame, (self.center_x, self.center_y), radius, color, 2)
-            label_x = self.center_x
-            label_y = self.center_y - radius - 20
-            cv2.putText(frame, str(score), (label_x, label_y), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # Outer rings (4-9, scores 6-1)
-        for ring_number in range(4, 10):
-            distance_from_center = self.black_circle_radius + (ring_number - 3) * self.outer_ring_increment
-            radius = int(distance_from_center)
-            score = 10 - ring_number
-            color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)][ring_number % 3]
+        """Draw the scoring zones (rings 1-10, scores 10-1) on the frame."""
+        for ring_number in range(1, 11):  # Rings 1 to 10 (scores 10 to 1)
+            radius = int(self.ring_increment * ring_number)
+            score = 11 - ring_number  # Ring 1 -> score 10, Ring 2 -> score 9, ..., Ring 10 -> score 1
+            color = [(255, 0, 0), (0, 255, 0), (0, 0, 255)][(ring_number - 1) % 3]
             cv2.circle(frame, (self.center_x, self.center_y), radius, color, 2)
             label_x = self.center_x
             label_y = self.center_y - radius - 20
@@ -116,18 +136,12 @@ class TargetScorer:
         """Calculate the score of a shot based on its position."""
         distance = np.sqrt((x - self.center_x)**2 + (y - self.center_y)**2)
         
-        if distance <= self.black_circle_radius:
-            # Inside the black circle (rings 0-3, scores 10-7)
-            ring_number = int(distance / self.inner_ring_increment)
-            score = 10 - ring_number
+        # Single ring increment for all rings (rings 1 to 10)
+        ring_number = int(distance / self.ring_increment)
+        if ring_number < 10:  # Rings 0 to 9 (since ring_number is 0-based here)
+            score = 10 - ring_number  # Ring 0 -> score 10, Ring 1 -> score 9, ..., Ring 9 -> score 1
         else:
-            # Outside the black circle (rings 4-9, scores 6-1)
-            distance_from_edge = distance - self.black_circle_radius
-            ring_number = 3 + int(distance_from_edge / self.outer_ring_increment)
-            if ring_number <= 9:
-                score = 10 - ring_number
-            else:
-                score = 0
+            score = 0  # Outside the scoring zones
         
         print(f"Scoring shot at ({x}, {y}): Distance = {distance:.1f}, Ring number = {ring_number}, Score = {score}")
         return score
@@ -174,14 +188,14 @@ class TargetScorer:
         print(f"Shot overlay shape: {self.shot_overlay.shape}, dtype: {self.shot_overlay.dtype}")
         
         self.draw_scoring_zones(output_frame)
-        success = cv2.imwrite("scoring_zones.jpg", output_frame)
+        success = cv2.imwrite("output/scoring_zones.jpg", output_frame)
         if success:
             print("Saved image with scoring zones as 'scoring_zones.jpg'")
         else:
             print("Failed to save image with scoring zones")
         
         cv2.circle(output_frame, (self.center_x, self.center_y), 30, (255, 255, 0), -1)
-        cv2.imwrite("scoring_zones_with_test.jpg", output_frame)
+        cv2.imwrite("output/scoring_zones_with_test.jpg", output_frame)
         print("Saved scoring_zones_with_test.jpg with a test marker at the center")
         
         shot_count = 0
@@ -217,17 +231,18 @@ class TargetScorer:
                 cv2.putText(self.shot_overlay, str(shot_count), (x + 30, y), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 4)
                 
-                # Debug: Save the shot overlay directly
-                overlay_filename = f"shot_overlay_{shot_count}.jpg"
+                overlay_filename = f"{OUTPUT_FOLDER}/shot_overlay_{shot_count}.jpg"
                 success = cv2.imwrite(overlay_filename, self.shot_overlay)
                 if success:
                     print(f"Saved shot overlay after shot {shot_count}: {overlay_filename}")
                 else:
                     print(f"Failed to save shot overlay after shot {shot_count}")
                 
-                # Combine using cv2.add
                 combined_frame = cv2.add(output_frame, self.shot_overlay)
-                intermediate_filename = f"intermediate_shot_{shot_count}.jpg"
+                cv2.imwrite(f"{OUTPUT_FOLDER}/combined_before_intermediate_{shot_count}.jpg", combined_frame)
+                print(f"Saved combined frame before intermediate: combined_before_intermediate_{shot_count}.jpg")
+
+                intermediate_filename = f"{OUTPUT_FOLDER}/intermediate_shot_{shot_count}.jpg"
                 success = cv2.imwrite(intermediate_filename, combined_frame)
                 if success:
                     print(f"Saved intermediate image after shot {shot_count}: {intermediate_filename}")
@@ -241,9 +256,11 @@ class TargetScorer:
             else:
                 time.sleep(0.5)
         
-        output_filename = f"target_result_{int(time.time())}.jpg"
+        output_filename = f"{OUTPUT_FOLDER}/target_result_{int(time.time())}.jpg"
         print("Saving output image...")
         combined_frame = cv2.add(output_frame, self.shot_overlay)
+        cv2.imwrite(f"{OUTPUT_FOLDER}/final_combined.jpg", combined_frame)
+        print("Saved final combined frame as 'final_combined.jpg'")
         success = cv2.imwrite(output_filename, combined_frame)
         if success:
             print(f"Session complete! Total score: {self.total_score}. Output saved as '{output_filename}'.")
@@ -252,7 +269,7 @@ class TargetScorer:
         
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         cv2.circle(test_image, (50, 50), 10, (255, 0, 0), -1)
-        cv2.imwrite("test_drawing.jpg", test_image)
+        cv2.imwrite("output/test_drawing.jpg", test_image)
         print("Saved test_drawing.jpg to verify OpenCV drawing functionality.")
 
         if self.mode == "live" and self.camera is not None:
